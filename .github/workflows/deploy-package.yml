@@ -46,10 +46,10 @@ jobs:
           rid: osx-arm64
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Setup .NET 10.0 SDK
-      uses: actions/setup-dotnet@v4
+      uses: actions/setup-dotnet@v6
       with:
         dotnet-version: 10.0.x
 
@@ -81,7 +81,7 @@ jobs:
         }
 
     - name: Upload RID-specific package
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: nupkg-${{ matrix.rid }}
         path: ${{ github.workspace }}/packages/*.${{ matrix.rid }}.*.nupkg
@@ -98,7 +98,7 @@ jobs:
       VersionPrefix: ${{ needs.version.outputs.version-prefix }}
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Setup .NET 10.0 SDK
       uses: actions/setup-dotnet@v4
@@ -112,7 +112,7 @@ jobs:
         user: ${{ secrets.NUGET_USER }}
 
     - name: Download RID-specific packages
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         pattern: nupkg-*
         path: ${{ github.workspace }}/packages
