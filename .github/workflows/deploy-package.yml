@@ -5,50 +5,138 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
-    name: "Build Project"
+  version:
+    name: "Set package version"
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write  # enable GitHub OIDC token issuance for this job
 
     env:
       MajorVersion: 0
       MinorVersion: 5
-    steps:
-    - uses: actions/checkout@v2
 
-    # Get a short-lived NuGet API key
+    outputs:
+      version-prefix: ${{ steps.version.outputs.version-prefix }}
+
+    steps:
+    - name: Set Version Prefix
+      id: version
+      run: echo "version-prefix=${MajorVersion}.${MinorVersion}.$(date +'%y%m').$(date +'%d')${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+  package-rid:
+    name: "Package Native AOT (${{ matrix.rid }})"
+    needs: version
+    runs-on: ${{ matrix.os }}
+
+    env:
+      RID: ${{ matrix.rid }}
+      VersionPrefix: ${{ needs.version.outputs.version-prefix }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: windows-latest
+          rid: win-x64
+        - os: windows-latest
+          rid: win-arm64
+        - os: ubuntu-latest
+          rid: linux-x64
+        - os: ubuntu-latest
+          rid: linux-arm64
+        - os: macos-13
+          rid: osx-x64
+        - os: macos-14
+          rid: osx-arm64
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET 10.0 SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Package Native AOT tool
+      shell: pwsh
+      run: >
+        dotnet pack ./src/HaveIBeenPwned.PwnedPasswords.Downloader/HaveIBeenPwned.PwnedPasswords.Downloader.csproj
+        --configuration Release
+        --runtime $env:RID
+        -p:VersionPrefix="$env:VersionPrefix"
+        -p:PackageOutputPath="$env:GITHUB_WORKSPACE/packages"
+
+    - name: Validate RID-specific package
+      shell: pwsh
+      run: |
+        $packages = @(Get-ChildItem "$env:GITHUB_WORKSPACE/packages" -File -Filter "*.$env:RID.*.nupkg")
+        if ($packages.Count -ne 1) {
+          throw "Expected exactly one $env:RID Native AOT package, found $($packages.Count)."
+        }
+
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($packages[0].FullName)
+        try {
+          if (-not ($archive.Entries | Where-Object FullName -like 'tools/*')) {
+            throw "The $env:RID package does not contain tool payload files."
+          }
+        }
+        finally {
+          $archive.Dispose()
+        }
+
+    - name: Upload RID-specific package
+      uses: actions/upload-artifact@v4
+      with:
+        name: nupkg-${{ matrix.rid }}
+        path: ${{ github.workspace }}/packages/*.${{ matrix.rid }}.*.nupkg
+        if-no-files-found: error
+
+  publish:
+    name: "Publish packages"
+    needs: [version, package-rid]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+
+    env:
+      VersionPrefix: ${{ needs.version.outputs.version-prefix }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET 10.0 SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.x
+
     - name: NuGet login (OIDC → temp API key)
       uses: NuGet/login@v1
       id: login
       with:
         user: ${{ secrets.NUGET_USER }}
-        
-    - name: Get current date
-      id: version
-      run: echo "::set-output name=date::$(date +'%Y%m.%d')"
 
-    - name: Get branch name (merge)
-      if: github.event_name != 'pull_request'
-      run: echo "Branch=$(echo ${GITHUB_REF#refs/heads/} | tr / -)" >> $GITHUB_ENV
-
-    - name: Get branch name (pull request)
-      if: github.event_name == 'pull_request'
-      run: echo "Branch=$(echo ${GITHUB_HEAD_REF} | tr / -)" >> $GITHUB_ENV
-
-    - name: Set Version Prefix
-      env:
-        VERPREF: ${{ format('{0}.{1}.{2}{3}', env.MajorVersion, env.MinorVersion, steps.date.outputs.date, github.run_number) }}
-      run: echo "VersionPrefix=$(echo ${VERPREF})" >> $GITHUB_ENV
-    
-    - name: Setup .NET 9.0 SDK
-      uses: actions/setup-dotnet@v1
+    - name: Download RID-specific packages
+      uses: actions/download-artifact@v4
       with:
-        dotnet-version: 9.x
+        pattern: nupkg-*
+        path: ${{ github.workspace }}/packages
+        merge-multiple: true
 
-    - name: Build Project
-      run: dotnet pack ./src/HaveIBeenPwned.PwnedPasswords.Downloader/HaveIBeenPwned.PwnedPasswords.Downloader.csproj --configuration Release
-    
-    # Push the package
-    - name: NuGet push
-      run: dotnet nuget push  ./src/HaveIBeenPwned.PwnedPasswords.Downloader/nupkg/*.nupkg --api-key ${{steps.login.outputs.NUGET_API_KEY}} --source https://api.nuget.org/v3/index.json --skip-duplicate --no-symbols 
+    - name: Publish RID-specific packages
+      shell: bash
+      run: |
+        find "${GITHUB_WORKSPACE}/packages" -type f -name '*.nupkg' -print0 |
+          xargs -0 -r -n 1 dotnet nuget push --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate --no-symbols
+
+    - name: Package tool pointer
+      run: >
+        dotnet pack ./src/HaveIBeenPwned.PwnedPasswords.Downloader/HaveIBeenPwned.PwnedPasswords.Downloader.csproj
+        --configuration Release
+        -p:VersionPrefix="${VersionPrefix}"
+        -p:PackageOutputPath="${GITHUB_WORKSPACE}/pointer-package"
+
+    - name: Publish tool pointer
+      run: >
+        dotnet nuget push "${GITHUB_WORKSPACE}/pointer-package/haveibeenpwned-downloader.${VersionPrefix}.nupkg"
+        --api-key "${{ steps.login.outputs.NUGET_API_KEY }}"
+        --source https://api.nuget.org/v3/index.json
+        --skip-duplicate
+        --no-symbols

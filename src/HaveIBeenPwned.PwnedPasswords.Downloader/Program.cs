@@ -1,9 +1,9 @@
 ﻿using System.Buffers.Binary;
-using System.ComponentModel;
 using System.Diagnostics;
-using System.Diagnostics.CodeAnalysis;
+using System.CommandLine;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Channels;
 
@@ -15,33 +15,24 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Win32.SafeHandles;
 
 using Spectre.Console;
-using Spectre.Console.Cli;
-
-IHostBuilder host = CreateHostBuilder(args);
-host.ConfigureLogging(builder =>
-{
-    builder.ClearProviders();
-});
-
-var registrar = new TypeRegistrar(host);
-
-var app = new CommandApp<PwnedPasswordsDownloader>(registrar);
-
-app.Configure(config => config.PropagateExceptions());
 
 try
 {
-    return await app.RunAsync(args);
+    using IHost host = CreateHostBuilder(args).Build();
+    PwnedPasswordsDownloader downloader = host.Services.GetRequiredService<PwnedPasswordsDownloader>();
+    RootCommand command = CreateRootCommand(downloader);
+    return await command.Parse(args).InvokeAsync();
 }
 catch (Exception ex)
 {
-    AnsiConsole.WriteException(ex, ExceptionFormats.ShortenEverything);
+    ConsoleExceptionWriter.Write(ex);
     return -99;
 }
 
 static IHostBuilder CreateHostBuilder(string[] args) =>
     Host
     .CreateDefaultBuilder(args)
+    .ConfigureLogging(builder => builder.ClearProviders())
     .ConfigureServices((hostContext, services) =>
     {
         services
@@ -51,6 +42,7 @@ static IHostBuilder CreateHostBuilder(string[] args) =>
             handler.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
             handler.SslOptions.EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls13 | System.Security.Authentication.SslProtocols.Tls12;
             handler.EnableMultipleHttp2Connections = true;
+            handler.EnableMultipleHttp3Connections = true;
         })
         .ConfigureHttpClient(client =>
         {
@@ -61,11 +53,73 @@ static IHostBuilder CreateHostBuilder(string[] args) =>
                 client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("hibp-downloader", FileVersionInfo.GetVersionInfo(process).ProductVersion));
             }
 
-            client.DefaultRequestVersion = HttpVersion.Version20;
+            client.DefaultRequestVersion = HttpVersion.Version30;
             client.DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower;
             client.Timeout = TimeSpan.FromSeconds(5);
         });
+
+        services.AddSingleton<PwnedPasswordsDownloader>();
     });
+
+static RootCommand CreateRootCommand(PwnedPasswordsDownloader downloader)
+{
+    Argument<string> outputFileArgument = new("outputFile")
+    {
+        Description = "Name of the output. Defaults to pwnedpasswords, which writes hash ranges to a directory called pwnedpasswords. Use --single to write pwnedpasswords.txt instead.",
+        DefaultValueFactory = _ => "pwnedpasswords"
+    };
+    Option<int> parallelismOption = new("--parallelism", "-p")
+    {
+        Description = "The number of parallel requests to make to Have I Been Pwned to download the hash ranges. If omitted or less than 2, defaults to eight times the number of processors on the machine.",
+        DefaultValueFactory = _ => 0
+    };
+    Option<bool> overwriteOption = new("--overwrite", "-o")
+    {
+        Description = "Overwrite existing files while writing the results."
+    };
+    Option<bool> singleFileOption = new("--single", "-s")
+    {
+        Description = "Write the hash ranges into a single .txt file instead of individual files in a directory."
+    };
+    Option<bool> fetchNtlmOption = new("--ntlm", "-n")
+    {
+        Description = "Fetch NTLM hashes instead of SHA1."
+    };
+    Option<int?> maxRetriesOption = new("--max-retries")
+    {
+        Description = "Maximum number of retries per prefix. Omit for unlimited retries. Use 0 to disable retries."
+    };
+
+    RootCommand command = new("Download Pwned Passwords hash ranges for offline use.");
+    command.Arguments.Add(outputFileArgument);
+    command.Options.Add(parallelismOption);
+    command.Options.Add(overwriteOption);
+    command.Options.Add(singleFileOption);
+    command.Options.Add(fetchNtlmOption);
+    command.Options.Add(maxRetriesOption);
+    command.SetAction(async (parseResult, cancellationToken) =>
+    {
+        PwnedPasswordsDownloader.Settings settings = new()
+        {
+            OutputFile = parseResult.GetValue(outputFileArgument) ?? "pwnedpasswords",
+            Parallelism = parseResult.GetValue(parallelismOption),
+            Overwrite = parseResult.GetValue(overwriteOption),
+            SingleFile = parseResult.GetValue(singleFileOption),
+            FetchNtlm = parseResult.GetValue(fetchNtlmOption),
+            MaxRetries = parseResult.GetValue(maxRetriesOption)
+        };
+
+        if (settings.MaxRetries < 0)
+        {
+            AnsiConsole.MarkupLine("[red]--max-retries must be 0 or greater.[/]");
+            return 1;
+        }
+
+        return await downloader.ExecuteAsync(settings, cancellationToken).ConfigureAwait(false);
+    });
+
+    return command;
+}
 
 internal sealed class Statistics
 {
@@ -78,7 +132,13 @@ internal sealed class Statistics
     public double HashesPerSecond => HashesDownloaded / (ElapsedMilliseconds / 1000.0);
 }
 
-internal sealed class PwnedPasswordsDownloader : AsyncCommand<PwnedPasswordsDownloader.Settings>
+internal static class ConsoleExceptionWriter
+{
+    internal static void Write(Exception exception) =>
+        AnsiConsole.MarkupLine($"[red]{exception.GetType().Name.EscapeMarkup()}: {exception.Message.EscapeMarkup()}[/]");
+}
+
+internal sealed class PwnedPasswordsDownloader
 {
     private static readonly TimeSpan s_retryDelay = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan s_maxRetryDelay = TimeSpan.FromSeconds(10);
@@ -90,55 +150,32 @@ internal sealed class PwnedPasswordsDownloader : AsyncCommand<PwnedPasswordsDown
         _httpClient = httpClientFactory.CreateClient("PwnedPasswords");
     }
 
-    public sealed class Settings : CommandSettings
+    public sealed class Settings
     {
-        [Description("Name of the output. Defaults to pwnedpasswords, which writes the output to pwnedpasswords.txt for single file output, or a directory called pwnedpasswords.")]
-        [CommandArgument(0, "[outputFile]")]
         public string OutputFile { get; init; } = "pwnedpasswords";
-
-        [Description("The number of parallel requests to make to Have I Been Pwned to download the hash ranges. If omitted or less than 2, defaults to eight times the number of processors on the machine.")]
-        [CommandOption("-p||--parallelism")]
-        [DefaultValue(0)]
-        public int Parallelism { get; set; }
-
-        [Description("When set, overwrite any existing files while writing the results. Defaults to false.")]
-        [CommandOption("-o|--overwrite")]
-        [DefaultValue(false)]
-        public bool Overwrite { get; set; } = false;
-
-        [Description("When set, writes the hash ranges into a single .txt file. Otherwise downloads ranges to individual files into a subfolder. If ommited defaults to single file.")]
-        [CommandOption("-s|--single")]
-        [DefaultValue(true)]
-        public bool SingleFile { get; set; } = true;
-
-        [Description("When set, fetches NTLM hashes instead of SHA1.")]
-        [CommandOption("-n|--ntlm")]
-        [DefaultValue(false)]
-        public bool FetchNtlm { get; set; } = false;
-
-        [Description("Maximum number of retries per prefix. Omit for unlimited retries. Use 0 to disable retries.")]
-        [CommandOption("--max-retries")]
+        public int Parallelism { get; init; }
+        public bool Overwrite { get; init; }
+        public bool SingleFile { get; init; }
+        public bool FetchNtlm { get; init; }
         public int? MaxRetries { get; init; }
-
-        public override ValidationResult Validate()
-        {
-            if (MaxRetries < 0)
-            {
-                return ValidationResult.Error("--max-retries must be 0 or greater.");
-            }
-
-            return ValidationResult.Success();
-        }
     }
 
-    public override async Task<int> ExecuteAsync([NotNull] CommandContext context, [NotNull] Settings settings)
+    public async Task<int> ExecuteAsync(Settings settings, CancellationToken commandCancellationToken)
     {
         if (settings.Parallelism < 2)
         {
-            settings.Parallelism = Math.Max(Environment.ProcessorCount * 8, 2);
+            settings = new Settings
+            {
+                OutputFile = settings.OutputFile,
+                Parallelism = Math.Max(Environment.ProcessorCount * 8, 2),
+                Overwrite = settings.Overwrite,
+                SingleFile = settings.SingleFile,
+                FetchNtlm = settings.FetchNtlm,
+                MaxRetries = settings.MaxRetries
+            };
         }
 
-        using CancellationTokenSource cancellationTokenSource = new();
+        using CancellationTokenSource cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(commandCancellationToken);
         ConsoleCancelEventHandler cancelHandler = (_, args) =>
         {
             args.Cancel = true;
@@ -217,7 +254,7 @@ internal sealed class PwnedPasswordsDownloader : AsyncCommand<PwnedPasswordsDown
         catch (Exception e)
         {
             AnsiConsole.MarkupLine($"Failed to download hash ranges: {e.Message}");
-            AnsiConsole.WriteException(e);
+            ConsoleExceptionWriter.Write(e);
 
             return -1;
         }
@@ -338,11 +375,17 @@ internal sealed class PwnedPasswordsDownloader : AsyncCommand<PwnedPasswordsDown
 
         return await ExecuteWithRetriesAsync(prefix, "downloading range data", maxRetries, async retryCancellationToken =>
         {
+            using HttpResponseMessage response = await GetPwnedPasswordsRangeFromWeb(prefix, fetchNtlm, retryCancellationToken).ConfigureAwait(false);
+            byte[] expectedContentMd5 = GetContentMd5(response);
+            await using Stream stream = await response.Content.ReadAsStreamAsync(retryCancellationToken).ConfigureAwait(false);
+            await using MemoryStream responseContent = new();
+            await stream.CopyToAsync(responseContent, retryCancellationToken).ConfigureAwait(false);
+            ValidateContentMd5(expectedContentMd5, responseContent.GetBuffer().AsSpan(0, checked((int)responseContent.Length)));
+
+            responseContent.Position = 0;
             await using MemoryStream output = new();
             await using StreamWriter writer = new(output, Encoding.UTF8, leaveOpen: true);
-            using HttpResponseMessage response = await GetPwnedPasswordsRangeFromWeb(prefix, fetchNtlm, retryCancellationToken).ConfigureAwait(false);
-            await using Stream stream = await response.Content.ReadAsStreamAsync(retryCancellationToken).ConfigureAwait(false);
-            using StreamReader reader = new(stream);
+            using StreamReader reader = new(responseContent);
 
             while (await reader.ReadLineAsync(retryCancellationToken).ConfigureAwait(false) is { } line)
             {
@@ -380,12 +423,32 @@ internal sealed class PwnedPasswordsDownloader : AsyncCommand<PwnedPasswordsDown
         await ExecuteWithRetriesAsync(prefix, "downloading range file", maxRetries, async retryCancellationToken =>
         {
             using HttpResponseMessage response = await GetPwnedPasswordsRangeFromWeb(prefix, fetchNtlm, retryCancellationToken).ConfigureAwait(false);
+            byte[] expectedContentMd5 = GetContentMd5(response);
             await using Stream stream = await response.Content.ReadAsStreamAsync(retryCancellationToken).ConfigureAwait(false);
             using SafeFileHandle handle = File.OpenHandle(Path.Combine(outputDirectory, $"{prefix}.txt"), FileMode.Create, FileAccess.Write, FileShare.None, FileOptions.Asynchronous);
-            await handle.CopyFrom(stream, cancellationToken: retryCancellationToken).ConfigureAwait(false);
+            using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
+            await handle.CopyFrom(stream, hash, cancellationToken: retryCancellationToken).ConfigureAwait(false);
+            ValidateContentMd5(expectedContentMd5, hash.GetHashAndReset());
         }, cancellationToken).ConfigureAwait(false);
 
         Interlocked.Increment(ref _statistics.HashesDownloaded);
+    }
+
+    private static byte[] GetContentMd5(HttpResponseMessage response) =>
+        response.Content.Headers.ContentMD5 ?? throw new InvalidDataException("Response did not contain a Content-MD5 header.");
+
+    private static void ValidateContentMd5(byte[] expectedHash, ReadOnlySpan<byte> content)
+    {
+        byte[] actualHash = MD5.HashData(content);
+        ValidateContentMd5(expectedHash, actualHash);
+    }
+
+    private static void ValidateContentMd5(byte[] expectedHash, byte[] actualHash)
+    {
+        if (!CryptographicOperations.FixedTimeEquals(expectedHash, actualHash))
+        {
+            throw new InvalidDataException("Response body did not match its Content-MD5 header.");
+        }
     }
 
     private static TimeSpan GetRetryDelay(int retryAttempt) => TimeSpan.FromSeconds(Math.Min(retryAttempt * s_retryDelay.TotalSeconds, s_maxRetryDelay.TotalSeconds));
@@ -445,24 +508,4 @@ internal sealed class PwnedPasswordsDownloader : AsyncCommand<PwnedPasswordsDown
         public string Prefix { get; }
         public byte[] Content { get; }
     }
-}
-
-public sealed class TypeRegistrar(IHostBuilder builder) : ITypeRegistrar
-{
-    public ITypeResolver Build() => new TypeResolver(builder.Build());
-
-    public void Register(Type service, Type implementation) => builder.ConfigureServices((_, services) => services.AddSingleton(service, implementation));
-    public void RegisterInstance(Type service, object implementation) => builder.ConfigureServices((_, services) => services.AddSingleton(service, implementation));
-    public void RegisterLazy(Type service, Func<object> func)
-    {
-        ArgumentNullException.ThrowIfNull(func);
-        builder.ConfigureServices((_, services) => services.AddSingleton(service, _ => func()));
-    }
-}
-
-public sealed class TypeResolver(IHost provider) : ITypeResolver, IDisposable
-{
-    private readonly IHost _host = provider ?? throw new ArgumentNullException(nameof(provider));
-    public object? Resolve(Type? type) => type != null ? _host.Services.GetService(type) : null;
-    public void Dispose() => _host.Dispose();
 }

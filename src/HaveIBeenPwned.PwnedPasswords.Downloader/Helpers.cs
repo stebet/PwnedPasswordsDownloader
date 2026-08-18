@@ -3,6 +3,7 @@
 
 using System.Collections.Concurrent;
 using System.IO.Pipelines;
+using System.Security.Cryptography;
 using Microsoft.Win32.SafeHandles;
 
 namespace HaveIBeenPwned.PwnedPasswords
@@ -31,7 +32,7 @@ namespace HaveIBeenPwned.PwnedPasswords
             }
         }
 
-        internal static async Task CopyFrom<T>(this SafeFileHandle handle, T stream, int offset = 0, CancellationToken cancellationToken = default) where T : Stream
+        internal static async Task CopyFrom<T>(this SafeFileHandle handle, T stream, IncrementalHash? hash = null, int offset = 0, CancellationToken cancellationToken = default) where T : Stream
         {
             Pipe pipe = GetPipe();
             Task copyTask = stream.CopyToAsync(pipe.Writer, cancellationToken).ContinueWith(CompleteWriter, pipe.Writer).Unwrap();
@@ -46,6 +47,7 @@ namespace HaveIBeenPwned.PwnedPasswords
 
                     foreach (ReadOnlyMemory<byte> item in result.Buffer)
                     {
+                        hash?.AppendData(item.Span);
                         await RandomAccess.WriteAsync(handle, item, offset, cancellationToken).ConfigureAwait(false);
                         offset += item.Length;
                     }

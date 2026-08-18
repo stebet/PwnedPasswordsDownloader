@@ -6,7 +6,7 @@ An alternative to running this tool is to use Zsolt Müller's cURL approach in h
 # Installation
 
 ## Prerequisites
-You'll need to install the latest [LTS (Long Term Support)](https://dotnet.microsoft.com/en-us/download/dotnet/8.0) or [STS (Short Term Support)](https://dotnet.microsoft.com/en-us/download/dotnet/9.0) version of the .NET SDK to be able to install and run the tool.
+Install the [.NET 10 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0) or later to install the tool. Native AOT, self-contained packages are available for Windows x64, Linux x64, macOS x64, and macOS Apple silicon; the installed tool does not require a separate .NET runtime.
 
 ## How to install
 1. Open a command line window
@@ -28,13 +28,13 @@ dotnet nuget add source https://api.nuget.org/v3/index.json -n nuget.org
 
 
 ### Download all SHA1 hashes to a single txt file called `pwnedpasswords.txt`
-`haveibeenpwned-downloader.exe pwnedpasswords`
+`haveibeenpwned-downloader.exe pwnedpasswords --single`
 
 ### Download all SHA1 hashes to individual txt files into a custom directory called `hashes`
-`haveibeenpwned-downloader.exe pwnedpasswords -s false`
+`haveibeenpwned-downloader.exe hashes`
 
 ### Download all NTLM hashes to a single txt file called `pwnedpasswords_ntlm.txt`
-`haveibeenpwned-downloader.exe -n pwnedpasswords_ntlm`
+`haveibeenpwned-downloader.exe -n pwnedpasswords_ntlm --single`
 
 
 
@@ -42,13 +42,13 @@ dotnet nuget add source https://api.nuget.org/v3/index.json -n nuget.org
 
 
 ### Download all SHA1 hashes to a single txt file called `pwnedpasswords.txt` :
-`haveibeenpwned-downloader pwnedpasswords`
+`haveibeenpwned-downloader pwnedpasswords --single`
 
 ### Download all SHA1 hashes to individual txt files into a custom directory called `hashes`:
-`haveibeenpwned-downloader pwnedpasswords -s false`
+`haveibeenpwned-downloader hashes`
 
 ### Download all NTLM hashes to a single txt file called `pwnedpasswords_ntlm.txt` : 
-`haveibeenpwned-downloader -n pwnedpasswords_ntlm`
+`haveibeenpwned-downloader -n pwnedpasswords_ntlm --single`
 
 
 
@@ -56,7 +56,7 @@ dotnet nuget add source https://api.nuget.org/v3/index.json -n nuget.org
 
 | Parameter   | Default value | Description |
 |-------------|---------------|-------------|
-| -s/--single | true | Determines whether to download hashes to a single file or as individual .txt files into another directory |
+| -s/--single | false | When set, downloads hashes to a single file instead of individual .txt files in a directory |
 | -p/--parallelism | Same as `Environment.ProcessorCount` | Determines how many hashes to download at a time |
 | --max-retries | Unlimited | Determines how many times each prefix is retried after a failure. Omit for unlimited retries, or pass `0` to disable retries. Retry delays increase per prefix up to 10 seconds. |
 | -o/--overwrite | false | Determines if output files should be overwritten or not |
@@ -64,8 +64,8 @@ dotnet nuget add source https://api.nuget.org/v3/index.json -n nuget.org
 
 # Additional usage examples
 ## Download all hashes to individual txt files into a custom directory called `hashes` using 64 threads to download the hashes
-`haveibeenpwned-downloader.exe hashes -s false -p 64`
+`haveibeenpwned-downloader.exe hashes -p 64`
 ## Download all hashes to a single txt file called `pwnedpasswords.txt` using 64 threads, overwriting the file if it already exists
-`haveibeenpwned-downloader.exe pwnedpasswords -o -p 64`
+`haveibeenpwned-downloader.exe pwnedpasswords --single -o -p 64`
 ## Download all hashes with at most 5 retries per prefix
 `haveibeenpwned-downloader.exe pwnedpasswords --max-retries 5`
