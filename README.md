@@ -6,7 +6,7 @@ An alternative to running this tool is to use Zsolt Müller's cURL approach in h
 # Installation
 
 ## Prerequisites
-Install the [.NET 10 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0) or later to install the tool. Native AOT, self-contained packages are available for Windows x64, Linux x64, macOS x64, and macOS Apple silicon; the installed tool does not require a separate .NET runtime.
+Install the [.NET 10 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0) or later to install the tool. Native AOT, self-contained packages are available for Windows x64, Linux x64, and macOS Apple silicon; the installed tool does not require a separate .NET runtime.
 
 ## How to install
 1. Open a command line window
