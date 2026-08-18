@@ -90,7 +90,7 @@ jobs:
         if-no-files-found: error
 
   package-pointer:
-    name: "Package tool pointer"
+    name: "Package fallback and tool pointer"
     needs: version
     runs-on: ubuntu-latest
 
@@ -105,6 +105,21 @@ jobs:
       with:
         dotnet-version: 10.0.x
 
+    - name: Package framework-dependent fallback
+      run: >
+        dotnet pack ./src/HaveIBeenPwned.PwnedPasswords.Downloader/HaveIBeenPwned.PwnedPasswords.Downloader.csproj
+        --configuration Release
+        --runtime any
+        -p:PublishAot=false
+        -p:VersionPrefix="${VersionPrefix}"
+        -p:PackageOutputPath="${GITHUB_WORKSPACE}/fallback-package"
+
+    - name: Validate framework-dependent fallback
+      run: |
+        package="${GITHUB_WORKSPACE}/fallback-package/haveibeenpwned-downloader.any.${VersionPrefix}.nupkg"
+        test -f "${package}"
+        unzip -Z1 "${package}" | grep -Fx 'tools/net10.0/any/haveibeenpwned-downloader.dll'
+
     - name: Package tool pointer
       run: >
         dotnet pack ./src/HaveIBeenPwned.PwnedPasswords.Downloader/HaveIBeenPwned.PwnedPasswords.Downloader.csproj
@@ -113,4 +128,8 @@ jobs:
         -p:PackageOutputPath="${GITHUB_WORKSPACE}/pointer-package"
 
     - name: Validate pointer package
-      run: test -f "${GITHUB_WORKSPACE}/pointer-package/haveibeenpwned-downloader.${VersionPrefix}.nupkg"
+      run: |
+        package="${GITHUB_WORKSPACE}/pointer-package/haveibeenpwned-downloader.${VersionPrefix}.nupkg"
+        test -f "${package}"
+        unzip -p "${package}" 'tools/any/any/DotnetToolSettings.xml' |
+          grep -F 'RuntimeIdentifier="any" Id="haveibeenpwned-downloader.any"'

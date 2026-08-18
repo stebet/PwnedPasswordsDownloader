@@ -118,7 +118,16 @@ jobs:
         path: ${{ github.workspace }}/packages
         merge-multiple: true
 
-    - name: Publish RID-specific packages
+    - name: Package framework-dependent fallback
+      run: >
+        dotnet pack ./src/HaveIBeenPwned.PwnedPasswords.Downloader/HaveIBeenPwned.PwnedPasswords.Downloader.csproj
+        --configuration Release
+        --runtime any
+        -p:PublishAot=false
+        -p:VersionPrefix="${VersionPrefix}"
+        -p:PackageOutputPath="${GITHUB_WORKSPACE}/packages"
+
+    - name: Publish runtime packages
       shell: bash
       run: |
         find "${GITHUB_WORKSPACE}/packages" -type f -name '*.nupkg' -print0 |
