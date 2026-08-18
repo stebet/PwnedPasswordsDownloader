@@ -53,7 +53,7 @@ jobs:
     - name: Setup .NET 10.0 SDK
       uses: actions/setup-dotnet@v6
       with:
-        dotnet-version: 10.0.x
+        dotnet-version: 10.x
 
     - name: Package Native AOT tool
       shell: pwsh
@@ -103,7 +103,7 @@ jobs:
     - name: Setup .NET 10.0 SDK
       uses: actions/setup-dotnet@v6
       with:
-        dotnet-version: 10.0.x
+        dotnet-version: 10.x
 
     - name: Package framework-dependent fallback
       run: >
