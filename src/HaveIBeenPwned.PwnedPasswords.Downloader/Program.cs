@@ -81,6 +81,10 @@ static RootCommand CreateRootCommand(PwnedPasswordsDownloader downloader)
     {
         Description = "Maximum number of retries per prefix. Omit for unlimited retries. Use 0 to disable retries."
     };
+    Option<bool> forceOption = new("--force")
+    {
+        Description = "Ignore saved ETags, download every range, and rebuild the index for directory output."
+    };
 
     RootCommand command = new(
         """
@@ -105,6 +109,7 @@ static RootCommand CreateRootCommand(PwnedPasswordsDownloader downloader)
     command.Options.Add(singleFileOption);
     command.Options.Add(fetchNtlmOption);
     command.Options.Add(maxRetriesOption);
+    command.Options.Add(forceOption);
     command.SetAction(async (parseResult, cancellationToken) =>
     {
         PwnedPasswordsDownloader.Settings settings = new()
@@ -114,7 +119,8 @@ static RootCommand CreateRootCommand(PwnedPasswordsDownloader downloader)
             Overwrite = parseResult.GetValue(overwriteOption),
             SingleFile = parseResult.GetValue(singleFileOption),
             FetchNtlm = parseResult.GetValue(fetchNtlmOption),
-            MaxRetries = parseResult.GetValue(maxRetriesOption)
+            MaxRetries = parseResult.GetValue(maxRetriesOption),
+            Force = parseResult.GetValue(forceOption)
         };
 
         if (settings.MaxRetries < 0)
@@ -136,6 +142,10 @@ internal sealed class Statistics
     public int CloudflareHits;
     public int CloudflareMisses;
     public long CloudflareRequestTimeTotal;
+    public int ConditionalRequests;
+    public int NotModifiedRanges;
+    public int ModifiedRanges;
+    public int IndexEntries;
     public long ElapsedMilliseconds;
     public double HashesPerSecond => HashesDownloaded / (ElapsedMilliseconds / 1000.0);
 }
@@ -161,6 +171,7 @@ internal sealed class PwnedPasswordsDownloader(HttpClient httpClient)
         public bool SingleFile { get; init; }
         public bool FetchNtlm { get; init; }
         public int? MaxRetries { get; init; }
+        public bool Force { get; init; }
     }
 
     public async Task<int> ExecuteAsync(Settings settings, CancellationToken commandCancellationToken)
@@ -174,7 +185,8 @@ internal sealed class PwnedPasswordsDownloader(HttpClient httpClient)
                 Overwrite = settings.Overwrite,
                 SingleFile = settings.SingleFile,
                 FetchNtlm = settings.FetchNtlm,
-                MaxRetries = settings.MaxRetries
+                MaxRetries = settings.MaxRetries,
+                Force = settings.Force
             };
         }
 
@@ -216,16 +228,21 @@ internal sealed class PwnedPasswordsDownloader(HttpClient httpClient)
                             Directory.CreateDirectory(settings.OutputFile);
                         }
 
-                        if (!settings.Overwrite && Directory.EnumerateFiles(settings.OutputFile).Any())
+                        var indexPath = GetIndexPath(settings.OutputFile, settings.FetchNtlm);
+                        var indexExists = File.Exists(indexPath);
+                        if (!settings.Overwrite && !settings.Force && !indexExists && Directory.EnumerateFiles(settings.OutputFile).Any())
                         {
                             AnsiConsole.MarkupLine($"Output directory {settings.OutputFile.EscapeMarkup()} already exists and is not empty. Use -o if you want to overwrite files.");
                             return;
                         }
                     }
 
+                    RangeIndex? index = settings.SingleFile
+                        ? null
+                        : await RangeIndex.LoadAsync(GetIndexPath(settings.OutputFile, settings.FetchNtlm), settings.Force, cancellationTokenSource.Token).ConfigureAwait(false);
                     var timer = Stopwatch.StartNew();
-                    var progressTask = ctx.AddTask("[green]Hash ranges downloaded[/]", true, 1024 * 1024);
-                    var processTask = ProcessRanges(settings, cancellationTokenSource.Token);
+                    var progressTask = ctx.AddTask("[green]Hash ranges processed[/]", true, 1024 * 1024);
+                    var processTask = ProcessRanges(settings, index, cancellationTokenSource.Token);
 
                     do
                     {
@@ -236,6 +253,11 @@ internal sealed class PwnedPasswordsDownloader(HttpClient httpClient)
                     while (!processTask.IsCompleted);
 
                     await processTask.ConfigureAwait(false);
+                    if (index != null)
+                    {
+                        await index.SaveAsync(GetIndexPath(settings.OutputFile, settings.FetchNtlm), cancellationTokenSource.Token).ConfigureAwait(false);
+                        _statistics.IndexEntries = index.Count;
+                    }
 
                     _statistics.ElapsedMilliseconds = timer.ElapsedMilliseconds;
                     progressTask.Value = _statistics.HashesDownloaded;
@@ -243,8 +265,15 @@ internal sealed class PwnedPasswordsDownloader(HttpClient httpClient)
                     progressTask.StopTask();
                 });
 
-            AnsiConsole.MarkupLine($"Finished downloading all hash ranges in {_statistics.ElapsedMilliseconds:N0}ms ({_statistics.HashesPerSecond:N2} hashes per second).");
-            AnsiConsole.MarkupLine($"We made {_statistics.CloudflareRequests:N0} Cloudflare requests (avg response time: {(double)_statistics.CloudflareRequestTimeTotal / _statistics.CloudflareRequests:N2}ms). Of those, Cloudflare had already cached {_statistics.CloudflareHits:N0} requests, and made {_statistics.CloudflareMisses:N0} requests to the Have I Been Pwned origin server.");
+            AnsiConsole.MarkupLine($"Finished processing all hash ranges in {_statistics.ElapsedMilliseconds:N0}ms ({_statistics.HashesPerSecond:N2} hash ranges per second).");
+            var averageCloudflareResponseTime = _statistics.CloudflareRequests == 0
+                ? 0
+                : (double)_statistics.CloudflareRequestTimeTotal / _statistics.CloudflareRequests;
+            AnsiConsole.MarkupLine($"We made {_statistics.CloudflareRequests:N0} Cloudflare requests (avg response time: {averageCloudflareResponseTime:N2}ms). Of those, Cloudflare had already cached {_statistics.CloudflareHits:N0} requests, and made {_statistics.CloudflareMisses:N0} requests to the Have I Been Pwned origin server.");
+            if (!settings.SingleFile)
+            {
+                AnsiConsole.MarkupLine($"The index made {_statistics.ConditionalRequests:N0} conditional requests. {_statistics.NotModifiedRanges:N0} ranges were unchanged, {_statistics.ModifiedRanges:N0} were modified and downloaded, and the index now contains {_statistics.IndexEntries:N0} entries.");
+            }
 
             return 0;
         }
@@ -266,7 +295,7 @@ internal sealed class PwnedPasswordsDownloader(HttpClient httpClient)
         }
     }
 
-    private async Task<HttpResponseMessage> GetPwnedPasswordsRangeFromWeb(string prefix, bool fetchNtlm, CancellationToken cancellationToken)
+    private async Task<HttpResponseMessage> GetPwnedPasswordsRangeFromWeb(string prefix, bool fetchNtlm, string? etag, CancellationToken cancellationToken)
     {
         var cloudflareTimer = Stopwatch.StartNew();
         var requestUri = prefix;
@@ -275,14 +304,32 @@ internal sealed class PwnedPasswordsDownloader(HttpClient httpClient)
             requestUri += "?mode=ntlm";
         }
 
-        var response = await _httpClient.GetAsync(requestUri, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        using var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
+        if (etag != null)
+        {
+            request.Headers.IfNoneMatch.Add(EntityTagHeaderValue.Parse(etag));
+            Interlocked.Increment(ref _statistics.ConditionalRequests);
+        }
+
+        var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         Interlocked.Add(ref _statistics.CloudflareRequestTimeTotal, cloudflareTimer.ElapsedMilliseconds);
         Interlocked.Increment(ref _statistics.CloudflareRequests);
 
         TrackCloudflareCacheStatus(response);
 
+        if (response.StatusCode == HttpStatusCode.NotModified)
+        {
+            Interlocked.Increment(ref _statistics.NotModifiedRanges);
+            return response;
+        }
+
         if (response.IsSuccessStatusCode)
         {
+            if (etag != null)
+            {
+                Interlocked.Increment(ref _statistics.ModifiedRanges);
+            }
+
             return response;
         }
 
@@ -316,7 +363,10 @@ internal sealed class PwnedPasswordsDownloader(HttpClient httpClient)
         return Convert.ToHexString(bytes)[3..];
     }
 
-    private async Task ProcessRanges(Settings settings, CancellationToken cancellationToken)
+    private static string GetIndexPath(string outputDirectory, bool fetchNtlm) =>
+        Path.Combine(outputDirectory, fetchNtlm ? "ntlm.index" : "sha1.index");
+
+    private async Task ProcessRanges(Settings settings, RangeIndex? index, CancellationToken cancellationToken)
     {
         if (settings.SingleFile)
         {
@@ -341,7 +391,7 @@ internal sealed class PwnedPasswordsDownloader(HttpClient httpClient)
                 CancellationToken = cancellationToken
             }, async (i, _) =>
             {
-                await DownloadRangeToFile(i, settings.OutputFile, settings.FetchNtlm, settings.MaxRetries, cancellationToken).ConfigureAwait(false);
+                await DownloadRangeToFile(i, settings.OutputFile, settings.FetchNtlm, settings.MaxRetries, index, cancellationToken).ConfigureAwait(false);
             });
         }
     }
@@ -369,8 +419,8 @@ internal sealed class PwnedPasswordsDownloader(HttpClient httpClient)
 
         return await ExecuteWithRetriesAsync(prefix, "downloading range data", maxRetries, async retryCancellationToken =>
         {
-            using var response = await GetPwnedPasswordsRangeFromWeb(prefix, fetchNtlm, retryCancellationToken).ConfigureAwait(false);
-            var expectedContentMd5 = GetContentMd5(response);
+            using var response = await GetPwnedPasswordsRangeFromWeb(prefix, fetchNtlm, etag: null, retryCancellationToken).ConfigureAwait(false);
+            var expectedContentMd5 = GetContentMd5(prefix, response);
             await using var stream = await response.Content.ReadAsStreamAsync(retryCancellationToken).ConfigureAwait(false);
             await using MemoryStream responseContent = new();
             await stream.CopyToAsync(responseContent, retryCancellationToken).ConfigureAwait(false);
@@ -410,27 +460,60 @@ internal sealed class PwnedPasswordsDownloader(HttpClient httpClient)
         }, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task DownloadRangeToFile(int currentHash, string outputDirectory, bool fetchNtlm, int? maxRetries, CancellationToken cancellationToken)
+    private async Task DownloadRangeToFile(int currentHash, string outputDirectory, bool fetchNtlm, int? maxRetries, RangeIndex? index, CancellationToken cancellationToken)
     {
         var prefix = GetHashRange(currentHash);
+        var outputPath = Path.Combine(outputDirectory, $"{prefix}.txt");
+        var etag = index != null && File.Exists(outputPath) && index.TryGet(prefix, out var savedEtag)
+            ? savedEtag
+            : null;
 
         await ExecuteWithRetriesAsync(prefix, "downloading range file", maxRetries, async retryCancellationToken =>
         {
-            using var response = await GetPwnedPasswordsRangeFromWeb(prefix, fetchNtlm, retryCancellationToken).ConfigureAwait(false);
-            var expectedContentMd5 = GetContentMd5(response);
+            using var response = await GetPwnedPasswordsRangeFromWeb(prefix, fetchNtlm, etag, retryCancellationToken).ConfigureAwait(false);
+            if (response.StatusCode == HttpStatusCode.NotModified)
+            {
+                return;
+            }
+
+            var expectedContentMd5 = GetContentMd5(prefix, response);
             await using var stream = await response.Content.ReadAsStreamAsync(retryCancellationToken).ConfigureAwait(false);
-            await using var file = File.Open(Path.Combine(outputDirectory, $"{prefix}.txt"), new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.ReadWrite, Share = FileShare.None, BufferSize = 32767, Options = FileOptions.Asynchronous });
-            await stream.CopyToAsync(file, retryCancellationToken).ConfigureAwait(false);
-            await file.FlushAsync(retryCancellationToken).ConfigureAwait(false);
-            file.Seek(0, SeekOrigin.Begin);
-            ValidateContentMd5(expectedContentMd5, MD5.HashData(file));
+            await using (var file = File.Open(outputPath, new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.ReadWrite, Share = FileShare.None, BufferSize = 32767, Options = FileOptions.Asynchronous }))
+            {
+                await stream.CopyToAsync(file, retryCancellationToken).ConfigureAwait(false);
+                await file.FlushAsync(retryCancellationToken).ConfigureAwait(false);
+                file.Seek(0, SeekOrigin.Begin);
+                ValidateContentMd5(expectedContentMd5, MD5.HashData(file));
+            }
+
+            if (index != null)
+            {
+                var responseEtag = response.Headers.ETag?.ToString();
+                if (responseEtag != null)
+                {
+                    index.Set(prefix, responseEtag);
+                }
+                else
+                {
+                    AnsiConsole.MarkupLine($"[yellow]Response for prefix {prefix} did not contain an ETag header. The range will not be indexed.[/]");
+                    index.Remove(prefix);
+                }
+            }
         }, cancellationToken).ConfigureAwait(false);
 
         Interlocked.Increment(ref _statistics.HashesDownloaded);
     }
 
-    private static byte[] GetContentMd5(HttpResponseMessage response) =>
-        response.Content.Headers.ContentMD5 ?? throw new InvalidDataException("Response did not contain a Content-MD5 header.");
+    private static byte[] GetContentMd5(string prefix, HttpResponseMessage response)
+    {
+        if (response.Content.Headers.ContentMD5 is { } contentMd5)
+        {
+            return contentMd5;
+        }
+
+        AnsiConsole.MarkupLine($"[yellow]Response for prefix {prefix} did not contain a Content-MD5 header. The range cannot be verified.[/]");
+        throw new InvalidDataException("Response did not contain a Content-MD5 header.");
+    }
 
     private static void ValidateContentMd5(ReadOnlySpan<byte> expectedHash, ReadOnlySpan<byte> actualHash)
     {

@@ -25,6 +25,11 @@ dotnet nuget add source https://api.nuget.org/v3/index.json -n nuget.org
 ## Content verification
 Every downloaded hash range is verified against the `Content-MD5` response header supplied by the Pwned Passwords API before it is accepted. A verification failure is retried according to `--max-retries`; if retries are exhausted, the downloader fails rather than reporting the corrupt range as successfully downloaded.
 
+## Incremental directory downloads
+Directory downloads create `sha1.index` or `ntlm.index` in the output directory. The index is a prefix-sorted, tab-delimited list of range prefixes and ETags, written atomically. On later runs, the downloader sends the saved ETag with `If-None-Match`; ranges that have not changed are retained locally without downloading their content again. Ranges returned without an ETag are not indexed and download again on each run.
+
+Use `--force` to ignore the existing index, download every range, and rebuild the index. Indexes are not used with `--single`, which always creates a complete output file.
+
 # Usage Examples
 
 Run `haveibeenpwned-downloader` with no parameters to display its usage and examples. Supply an output name to begin a download.
@@ -72,6 +77,7 @@ Run `haveibeenpwned-downloader` with no parameters to display its usage and exam
 | --max-retries | Unlimited | Determines how many times each prefix is retried after a failure. Omit for unlimited retries, or pass `0` to disable retries. Retry delays increase per prefix up to 10 seconds. |
 | -o/--overwrite | false | Determines if output files should be overwritten or not |
 | -n/--ntlm | (none) | When set, the downloader fetches NTLM hashes instead of SHA1 |
+| --force | false | Ignores saved ETags, downloads every range, and rebuilds the index for directory output |
 
 # Additional usage examples
 ## Download all hashes to individual txt files into a custom directory called `hashes` using 64 threads to download the hashes
