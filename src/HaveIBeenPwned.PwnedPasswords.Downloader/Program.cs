@@ -1,26 +1,23 @@
-﻿using System.Buffers.Binary;
-using System.Diagnostics;
+using System.Buffers.Binary;
 using System.CommandLine;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Channels;
-
-using HaveIBeenPwned.PwnedPasswords;
-
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using Microsoft.Win32.SafeHandles;
-
 using Spectre.Console;
 
 try
 {
-    using IHost host = CreateHostBuilder(args).Build();
-    PwnedPasswordsDownloader downloader = host.Services.GetRequiredService<PwnedPasswordsDownloader>();
-    RootCommand command = CreateRootCommand(downloader);
+    using var httpClient = CreateHttpClient();
+    PwnedPasswordsDownloader downloader = new(httpClient);
+    var command = CreateRootCommand(downloader);
+    if (args.Length == 0)
+    {
+        args = ["--help"];
+    }
+
     return await command.Parse(args).InvokeAsync();
 }
 catch (Exception ex)
@@ -29,37 +26,32 @@ catch (Exception ex)
     return -99;
 }
 
-static IHostBuilder CreateHostBuilder(string[] args) =>
-    Host
-    .CreateDefaultBuilder(args)
-    .ConfigureLogging(builder => builder.ClearProviders())
-    .ConfigureServices((hostContext, services) =>
+static HttpClient CreateHttpClient()
+{
+    SocketsHttpHandler handler = new()
     {
-        services
-        .AddHttpClient("PwnedPasswords")
-        .UseSocketsHttpHandler((handler, provider) =>
-        {
-            handler.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
-            handler.SslOptions.EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls13 | System.Security.Authentication.SslProtocols.Tls12;
-            handler.EnableMultipleHttp2Connections = true;
-            handler.EnableMultipleHttp3Connections = true;
-        })
-        .ConfigureHttpClient(client =>
-        {
-            client.BaseAddress = new Uri("https://api.pwnedpasswords.com/range/");
-            string? process = Environment.ProcessPath;
-            if (process != null)
-            {
-                client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("hibp-downloader", FileVersionInfo.GetVersionInfo(process).ProductVersion));
-            }
+        AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
+        EnableMultipleHttp2Connections = true,
+        EnableMultipleHttp3Connections = true
+    };
+    handler.SslOptions.EnabledSslProtocols = System.Security.Authentication.SslProtocols.Tls13 | System.Security.Authentication.SslProtocols.Tls12;
 
-            client.DefaultRequestVersion = HttpVersion.Version30;
-            client.DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower;
-            client.Timeout = TimeSpan.FromSeconds(5);
-        });
+    HttpClient client = new(handler)
+    {
+        BaseAddress = new Uri("https://api.pwnedpasswords.com/range/"),
+        DefaultRequestVersion = HttpVersion.Version30,
+        DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower,
+        Timeout = TimeSpan.FromSeconds(5)
+    };
 
-        services.AddSingleton<PwnedPasswordsDownloader>();
-    });
+    var process = Environment.ProcessPath;
+    if (process != null)
+    {
+        client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("hibp-downloader", FileVersionInfo.GetVersionInfo(process).ProductVersion));
+    }
+
+    return client;
+}
 
 static RootCommand CreateRootCommand(PwnedPasswordsDownloader downloader)
 {
@@ -90,7 +82,23 @@ static RootCommand CreateRootCommand(PwnedPasswordsDownloader downloader)
         Description = "Maximum number of retries per prefix. Omit for unlimited retries. Use 0 to disable retries."
     };
 
-    RootCommand command = new("Download Pwned Passwords hash ranges for offline use.");
+    RootCommand command = new(
+        """
+        Download Pwned Passwords hash ranges for offline use.
+
+        Examples:
+          Download SHA1 hash ranges to individual files in the sha1-ranges directory:
+          haveibeenpwned-downloader sha1-ranges
+
+          Download full SHA1 hashes to sha1-hashes.txt:
+          haveibeenpwned-downloader sha1-hashes --single
+
+          Download NTLM hash ranges to individual files in the ntlm-ranges directory:
+          haveibeenpwned-downloader ntlm-ranges --ntlm
+
+          Download full NTLM hashes to ntlm-hashes.txt:
+          haveibeenpwned-downloader ntlm-hashes --ntlm --single
+        """);
     command.Arguments.Add(outputFileArgument);
     command.Options.Add(parallelismOption);
     command.Options.Add(overwriteOption);
@@ -138,17 +146,12 @@ internal static class ConsoleExceptionWriter
         AnsiConsole.MarkupLine($"[red]{exception.GetType().Name.EscapeMarkup()}: {exception.Message.EscapeMarkup()}[/]");
 }
 
-internal sealed class PwnedPasswordsDownloader
+internal sealed class PwnedPasswordsDownloader(HttpClient httpClient)
 {
-    private static readonly TimeSpan s_retryDelay = TimeSpan.FromSeconds(2);
-    private static readonly TimeSpan s_maxRetryDelay = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan _retryDelay = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan _maxRetryDelay = TimeSpan.FromSeconds(10);
     private readonly Statistics _statistics = new();
-    private readonly HttpClient _httpClient;
-
-    public PwnedPasswordsDownloader(IHttpClientFactory httpClientFactory)
-    {
-        _httpClient = httpClientFactory.CreateClient("PwnedPasswords");
-    }
+    private readonly HttpClient _httpClient = httpClient;
 
     public sealed class Settings
     {
@@ -175,12 +178,12 @@ internal sealed class PwnedPasswordsDownloader
             };
         }
 
-        using CancellationTokenSource cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(commandCancellationToken);
-        ConsoleCancelEventHandler cancelHandler = (_, args) =>
+        using var cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(commandCancellationToken);
+        void cancelHandler(object? _, ConsoleCancelEventArgs args)
         {
             args.Cancel = true;
             cancellationTokenSource.Cancel();
-        };
+        }
 
         Console.CancelKeyPress += cancelHandler;
 
@@ -220,10 +223,9 @@ internal sealed class PwnedPasswordsDownloader
                         }
                     }
 
-
                     var timer = Stopwatch.StartNew();
-                    ProgressTask progressTask = ctx.AddTask("[green]Hash ranges downloaded[/]", true, 1024 * 1024);
-                    Task processTask = ProcessRanges(settings, cancellationTokenSource.Token);
+                    var progressTask = ctx.AddTask("[green]Hash ranges downloaded[/]", true, 1024 * 1024);
+                    var processTask = ProcessRanges(settings, cancellationTokenSource.Token);
 
                     do
                     {
@@ -266,14 +268,14 @@ internal sealed class PwnedPasswordsDownloader
 
     private async Task<HttpResponseMessage> GetPwnedPasswordsRangeFromWeb(string prefix, bool fetchNtlm, CancellationToken cancellationToken)
     {
-        Stopwatch cloudflareTimer = Stopwatch.StartNew();
-        string requestUri = prefix;
+        var cloudflareTimer = Stopwatch.StartNew();
+        var requestUri = prefix;
         if (fetchNtlm)
         {
             requestUri += "?mode=ntlm";
         }
 
-        HttpResponseMessage response = await _httpClient.GetAsync(requestUri, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        var response = await _httpClient.GetAsync(requestUri, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         Interlocked.Add(ref _statistics.CloudflareRequestTimeTotal, cloudflareTimer.ElapsedMilliseconds);
         Interlocked.Increment(ref _statistics.CloudflareRequests);
 
@@ -284,14 +286,14 @@ internal sealed class PwnedPasswordsDownloader
             return response;
         }
 
-        HttpStatusCode statusCode = response.StatusCode;
+        var statusCode = response.StatusCode;
         response.Dispose();
         throw new HttpRequestException($"Response contained HTTP status code {(int)statusCode} ({statusCode}).", inner: null, statusCode);
     }
 
     private void TrackCloudflareCacheStatus(HttpResponseMessage response)
     {
-        if (!response.Headers.TryGetValues("CF-Cache-Status", out IEnumerable<string>? values))
+        if (!response.Headers.TryGetValues("CF-Cache-Status", out var values))
         {
             return;
         }
@@ -318,12 +320,12 @@ internal sealed class PwnedPasswordsDownloader
     {
         if (settings.SingleFile)
         {
-            Channel<Task<DownloadedRange>> downloadTasks = Channel.CreateBounded<Task<DownloadedRange>>(new BoundedChannelOptions(settings.Parallelism) { SingleReader = true, SingleWriter = true, AllowSynchronousContinuations = true });
-            await using FileStream file = File.Open($"{settings.OutputFile}.txt", new FileStreamOptions { Access = FileAccess.Write, BufferSize = 32767, Mode = FileMode.Create, Options = FileOptions.Asynchronous, Share = FileShare.None });
-            Task producerTask = StartDownloads(downloadTasks.Writer, settings, cancellationToken);
-            await foreach (Task<DownloadedRange> item in downloadTasks.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            var downloadTasks = Channel.CreateBounded<Task<DownloadedRange>>(new BoundedChannelOptions(settings.Parallelism) { SingleReader = true, SingleWriter = true, AllowSynchronousContinuations = true });
+            await using var file = File.Open($"{settings.OutputFile}.txt", new FileStreamOptions { Access = FileAccess.Write, BufferSize = 32767, Mode = FileMode.Create, Options = FileOptions.Asynchronous, Share = FileShare.None });
+            var producerTask = StartDownloads(downloadTasks.Writer, settings, cancellationToken);
+            await foreach (var item in downloadTasks.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
-                DownloadedRange range = await item.ConfigureAwait(false);
+                var range = await item.ConfigureAwait(false);
                 await WriteRangeToSingleFile(range, file, settings.MaxRetries, cancellationToken).ConfigureAwait(false);
                 Interlocked.Increment(ref _statistics.HashesDownloaded);
             }
@@ -332,7 +334,7 @@ internal sealed class PwnedPasswordsDownloader
         }
         else
         {
-            await Parallel.ForEachAsync(EnumerateRanges(), new ParallelOptions
+            await Parallel.ForEachAsync(Enumerable.Range(0, 1024 * 1024), new ParallelOptions
             {
                 MaxDegreeOfParallelism = settings.Parallelism,
                 TaskScheduler = TaskScheduler.Default,
@@ -344,19 +346,11 @@ internal sealed class PwnedPasswordsDownloader
         }
     }
 
-    private static IEnumerable<int> EnumerateRanges()
-    {
-        for (int i = 0; i < 1024 * 1024; i++)
-        {
-            yield return i;
-        }
-    }
-
     private async Task StartDownloads(ChannelWriter<Task<DownloadedRange>> channelWriter, Settings settings, CancellationToken cancellationToken)
     {
         try
         {
-            foreach (int i in EnumerateRanges())
+            foreach (var i in Enumerable.Range(0, 1024 * 1024))
             {
                 await channelWriter.WriteAsync(DownloadRangeToBuffer(i, settings.FetchNtlm, settings.MaxRetries, cancellationToken), cancellationToken).ConfigureAwait(false);
             }
@@ -371,18 +365,18 @@ internal sealed class PwnedPasswordsDownloader
 
     private async Task<DownloadedRange> DownloadRangeToBuffer(int currentHash, bool fetchNtlm, int? maxRetries, CancellationToken cancellationToken)
     {
-        string prefix = GetHashRange(currentHash);
+        var prefix = GetHashRange(currentHash);
 
         return await ExecuteWithRetriesAsync(prefix, "downloading range data", maxRetries, async retryCancellationToken =>
         {
-            using HttpResponseMessage response = await GetPwnedPasswordsRangeFromWeb(prefix, fetchNtlm, retryCancellationToken).ConfigureAwait(false);
-            byte[] expectedContentMd5 = GetContentMd5(response);
-            await using Stream stream = await response.Content.ReadAsStreamAsync(retryCancellationToken).ConfigureAwait(false);
+            using var response = await GetPwnedPasswordsRangeFromWeb(prefix, fetchNtlm, retryCancellationToken).ConfigureAwait(false);
+            var expectedContentMd5 = GetContentMd5(response);
+            await using var stream = await response.Content.ReadAsStreamAsync(retryCancellationToken).ConfigureAwait(false);
             await using MemoryStream responseContent = new();
             await stream.CopyToAsync(responseContent, retryCancellationToken).ConfigureAwait(false);
-            ValidateContentMd5(expectedContentMd5, responseContent.GetBuffer().AsSpan(0, checked((int)responseContent.Length)));
-
-            responseContent.Position = 0;
+            responseContent.Seek(0, SeekOrigin.Begin);
+            ValidateContentMd5(expectedContentMd5, MD5.HashData(responseContent));
+            responseContent.Seek(0, SeekOrigin.Begin);
             await using MemoryStream output = new();
             await using StreamWriter writer = new(output, Encoding.UTF8, leaveOpen: true);
             using StreamReader reader = new(responseContent);
@@ -403,9 +397,9 @@ internal sealed class PwnedPasswordsDownloader
         }, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task WriteRangeToSingleFile(DownloadedRange range, FileStream file, int? maxRetries, CancellationToken cancellationToken)
+    private static async Task WriteRangeToSingleFile(DownloadedRange range, FileStream file, int? maxRetries, CancellationToken cancellationToken)
     {
-        long startPosition = file.Position;
+        var startPosition = file.Position;
 
         await ExecuteWithRetriesAsync(range.Prefix, "writing single-file output", maxRetries, async retryCancellationToken =>
         {
@@ -418,17 +412,18 @@ internal sealed class PwnedPasswordsDownloader
 
     private async Task DownloadRangeToFile(int currentHash, string outputDirectory, bool fetchNtlm, int? maxRetries, CancellationToken cancellationToken)
     {
-        string prefix = GetHashRange(currentHash);
+        var prefix = GetHashRange(currentHash);
 
         await ExecuteWithRetriesAsync(prefix, "downloading range file", maxRetries, async retryCancellationToken =>
         {
-            using HttpResponseMessage response = await GetPwnedPasswordsRangeFromWeb(prefix, fetchNtlm, retryCancellationToken).ConfigureAwait(false);
-            byte[] expectedContentMd5 = GetContentMd5(response);
-            await using Stream stream = await response.Content.ReadAsStreamAsync(retryCancellationToken).ConfigureAwait(false);
-            using SafeFileHandle handle = File.OpenHandle(Path.Combine(outputDirectory, $"{prefix}.txt"), FileMode.Create, FileAccess.Write, FileShare.None, FileOptions.Asynchronous);
-            using IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
-            await handle.CopyFrom(stream, hash, cancellationToken: retryCancellationToken).ConfigureAwait(false);
-            ValidateContentMd5(expectedContentMd5, hash.GetHashAndReset());
+            using var response = await GetPwnedPasswordsRangeFromWeb(prefix, fetchNtlm, retryCancellationToken).ConfigureAwait(false);
+            var expectedContentMd5 = GetContentMd5(response);
+            await using var stream = await response.Content.ReadAsStreamAsync(retryCancellationToken).ConfigureAwait(false);
+            await using var file = File.Open(Path.Combine(outputDirectory, $"{prefix}.txt"), new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.ReadWrite, Share = FileShare.None, BufferSize = 32767, Options = FileOptions.Asynchronous });
+            await stream.CopyToAsync(file, retryCancellationToken).ConfigureAwait(false);
+            await file.FlushAsync(retryCancellationToken).ConfigureAwait(false);
+            file.Seek(0, SeekOrigin.Begin);
+            ValidateContentMd5(expectedContentMd5, MD5.HashData(file));
         }, cancellationToken).ConfigureAwait(false);
 
         Interlocked.Increment(ref _statistics.HashesDownloaded);
@@ -437,13 +432,7 @@ internal sealed class PwnedPasswordsDownloader
     private static byte[] GetContentMd5(HttpResponseMessage response) =>
         response.Content.Headers.ContentMD5 ?? throw new InvalidDataException("Response did not contain a Content-MD5 header.");
 
-    private static void ValidateContentMd5(byte[] expectedHash, ReadOnlySpan<byte> content)
-    {
-        byte[] actualHash = MD5.HashData(content);
-        ValidateContentMd5(expectedHash, actualHash);
-    }
-
-    private static void ValidateContentMd5(byte[] expectedHash, byte[] actualHash)
+    private static void ValidateContentMd5(ReadOnlySpan<byte> expectedHash, ReadOnlySpan<byte> actualHash)
     {
         if (!CryptographicOperations.FixedTimeEquals(expectedHash, actualHash))
         {
@@ -451,13 +440,13 @@ internal sealed class PwnedPasswordsDownloader
         }
     }
 
-    private static TimeSpan GetRetryDelay(int retryAttempt) => TimeSpan.FromSeconds(Math.Min(retryAttempt * s_retryDelay.TotalSeconds, s_maxRetryDelay.TotalSeconds));
+    private static TimeSpan GetRetryDelay(int retryAttempt) => TimeSpan.FromSeconds(Math.Min(retryAttempt * _retryDelay.TotalSeconds, _maxRetryDelay.TotalSeconds));
 
     private static void WriteRetryMessage(string prefix, string operation, int retryAttempt, int? maxRetries, TimeSpan delay, Exception exception)
     {
-        string retryLimit = maxRetries is int boundedRetryCount ? $"/{boundedRetryCount}" : string.Empty;
-        string exceptionType = exception.GetType().Name.EscapeMarkup();
-        string exceptionMessage = exception.Message.EscapeMarkup();
+        var retryLimit = maxRetries is int boundedRetryCount ? $"/{boundedRetryCount}" : string.Empty;
+        var exceptionType = exception.GetType().Name.EscapeMarkup();
+        var exceptionMessage = exception.Message.EscapeMarkup();
         AnsiConsole.MarkupLine($"[yellow]Retry {retryAttempt}{retryLimit} for prefix {prefix} in {delay.TotalSeconds:N0}s while {operation}. {exceptionType}: {exceptionMessage}[/]");
     }
 
@@ -474,7 +463,7 @@ internal sealed class PwnedPasswordsDownloader
 
     private static async Task<T> ExecuteWithRetriesAsync<T>(string prefix, string operation, int? maxRetries, Func<CancellationToken, Task<T>> work, CancellationToken cancellationToken)
     {
-        int retryAttempt = 0;
+        var retryAttempt = 0;
 
         while (true)
         {
@@ -490,22 +479,16 @@ internal sealed class PwnedPasswordsDownloader
                 }
 
                 retryAttempt++;
-                TimeSpan delay = GetRetryDelay(retryAttempt);
+                var delay = GetRetryDelay(retryAttempt);
                 WriteRetryMessage(prefix, operation, retryAttempt, maxRetries, delay, exception);
                 await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
             }
         }
     }
 
-    private sealed class DownloadedRange
+    private sealed class DownloadedRange(string prefix, byte[] content)
     {
-        public DownloadedRange(string prefix, byte[] content)
-        {
-            Prefix = prefix;
-            Content = content;
-        }
-
-        public string Prefix { get; }
-        public byte[] Content { get; }
+        public string Prefix { get; } = prefix;
+        public byte[] Content { get; } = content;
     }
 }
